@@ -1,0 +1,151 @@
+import json
+import boto3
+import botocore.session
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+import urllib3
+import random
+
+# Initialize AWS clients
+sqs = boto3.client('sqs')
+dynamodb = boto3.resource('dynamodb')
+ses = boto3.client('ses', region_name='us-east-1')  # Adjust region
+
+QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/423623832978/chatBot'
+DYNAMODB_TABLE = 'yelp-restaurants'
+SES_SENDER_EMAIL = 'dhairyatemp007@gmail.com'
+REGION = 'us-east-1'  # OpenSearch region
+OPENSEARCH_ENDPOINT = "https://search-restaurants-index-3ggdee5zyaddryvtjypdfslt2m.aos.us-east-1.on.aws"
+OPENSEARCH_INDEX = 'restaurants'
+
+# Create a botocore session
+session = botocore.session.get_session()
+credentials = session.get_credentials()
+
+
+def get_random_restaurant(cuisine):
+    """Query OpenSearch for restaurants of the given cuisine."""
+    method = 'GET'
+    endpoint = f"{OPENSEARCH_ENDPOINT}/{OPENSEARCH_INDEX}/_search"
+
+    # OpenSearch query to match the cuisine
+    query = {
+        "size": 10,  # Retrieve up to 10 restaurants to select from
+        "query": {
+            "match": {
+                "cuisine": cuisine.lower()
+            }
+        }
+    }
+    body = json.dumps(query)
+
+    # Prepare headers
+    headers = {
+        'Content-Type': 'application/json',
+        'Host': OPENSEARCH_ENDPOINT.replace('https://', '').replace('http://', '')
+    }
+
+    # Create a botocore AWSRequest
+    request = AWSRequest(method=method, url=endpoint, data=body, headers=headers)
+
+    # Sign the request using SigV4Auth
+    SigV4Auth(credentials, 'es', REGION).add_auth(request)
+
+    # Extract the signed headers
+    signed_headers = dict(request.headers.items())
+
+    # Send the request using urllib3
+    http = urllib3.PoolManager()
+    response = http.request(
+        method,
+        endpoint,
+        body=body,
+        headers=signed_headers
+    )
+
+    if response.status != 200:
+        raise Exception(f"OpenSearch query failed: {response.data.decode('utf-8')}")
+
+    results = json.loads(response.data.decode('utf-8')).get('hits', {}).get('hits', [])
+    if not results:
+        raise ValueError(f"No restaurants found for cuisine: {cuisine}")
+
+    # Pick a random restaurant ID from the results
+    restaurant_id = random.choice(results)['_source']['restaurant_id']
+    return restaurant_id
+
+def get_restaurant_details(restaurant_id):
+    """Fetch restaurant details from DynamoDB using the restaurant_id."""
+    table = dynamodb.Table(DYNAMODB_TABLE)
+    response = table.get_item(Key={'business_id': restaurant_id})
+
+    if 'Item' not in response:
+        raise ValueError(f"Restaurant ID {restaurant_id} not found in DynamoDB.")
+
+    return response['Item']
+
+def send_email(to_email, subject, body):
+    """Send an email using SES."""
+    ses.send_email(
+        Source=SES_SENDER_EMAIL,
+        Destination={'ToAddresses': [to_email]},
+        Message={
+            'Subject': {'Data': subject},
+            'Body': {'Text': {'Data': body}}
+        }
+    )
+
+def lambda_handler(event, context):
+    """Main handler function for the Lambda."""
+    # Pull a message from the SQS queue
+    response = sqs.receive_message(
+        QueueUrl=QUEUE_URL,
+        MaxNumberOfMessages=1
+    )
+
+    messages = response.get('Messages', [])
+    if not messages:
+        print("No messages in the queue.")
+        return {"statusCode": 200, "body": "No messages to process."}
+
+    message = messages[0]
+    body = json.loads(message['Body'])
+
+    # Extract relevant data from the SQS message
+    location = body.get('location', 'Unknown')
+    cuisine = body['cuisine']  # Mandatory field
+    dining_time = body.get('dining_time', 'N/A')
+    num_people = body.get('number_people', 'N/A')
+    email = body['email']  # Mandatory field
+
+    try:
+        # Get a random restaurant recommendation
+        restaurant_id = get_random_restaurant(cuisine)
+        restaurant = get_restaurant_details(restaurant_id)
+
+        # Format the email content
+        subject = f"Your {cuisine} Restaurant Recommendations"
+        email_body = (
+            f"Hello!\n\nHere is a {cuisine} restaurant suggestion for your dining in {location}:\n\n"
+            f"Name: {restaurant['name']}\n"
+            f"Address: {restaurant['address']}\n"
+            f"Rating: {restaurant['rating']} stars\n"
+            f"Number of Reviews: {restaurant['review_count']}\n"
+            f"Dinner Time: {dining_time} for {num_people} people\n\n"
+            f"Enjoy your meal!"
+        )
+
+        # Send the email
+        send_email(email, subject, email_body)
+
+        # Delete the processed message from the SQS queue
+        sqs.delete_message(
+            QueueUrl=QUEUE_URL,
+            ReceiptHandle=message['ReceiptHandle']
+        )
+        print(f"Successfully sent email to {email}.")
+        return {"statusCode": 200, "body": "Email sent successfully"}
+
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {"statusCode": 500, "body": f"Failed to process message: {str(e)}"}
