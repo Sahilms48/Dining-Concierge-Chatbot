@@ -1,5 +1,5 @@
 
-# 🍽️ Restaurant Chatbot – CC Assignment 01
+# 🍽️ Restaurant Chatbot
 
 ![AWS Lambda](https://img.shields.io/badge/AWS%20Lambda-Deployed-orange)  
 ![ElasticSearch](https://img.shields.io/badge/ElasticSearch-Setup-green)  
